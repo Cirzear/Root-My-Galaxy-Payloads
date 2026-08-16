@@ -1,2 +1,4 @@
 /build/
 /diagnostics/
+/.toolcache/
+/src/targets/*/target-*.h

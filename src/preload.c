@@ -120,6 +120,56 @@ __attribute__((constructor)) static void load(void) {
   int p0_attempt_timeout_sec = env_int(
       "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 5,
       attempt_timeout_sec);
+#if defined(APP_PAYLOAD) && APP_PAYLOAD
+  /* The Android wrapper's short retry values were tuned for the old
+   * virtual-only route.  The physical P0 oracle needs a full scan window;
+   * normalize those values here so a transient miss does not terminate the
+   * run before the bounded direct-map search completes. */
+#if ((defined(APP_ROOT_SINGLE_ATTEMPT) && APP_ROOT_SINGLE_ATTEMPT) || \
+    (defined(APP_P0_PREPARE_P0_ONLY) && APP_P0_PREPARE_P0_ONLY) || \
+    (defined(APP_P0_PREPARE_DIAGNOSTIC) && APP_P0_PREPARE_DIAGNOSTIC)) && \
+    !(defined(APP_ALLOW_FRESH_P0_RETRIES) && APP_ALLOW_FRESH_P0_RETRIES)
+  if (max_attempts < 1) {
+    max_attempts = 1;
+  }
+#else
+  /* Keep retries bounded on this kernel.  The prior hard minimum of 16
+   * repeated full P0 scans long after the allocator had stopped producing a
+   * candidate; eight clean sessions cover the observed hit rate without
+   * turning a miss into a prolonged high-load run. */
+#ifdef APP_MIN_EXPLOIT_ATTEMPTS
+  if (max_attempts < APP_MIN_EXPLOIT_ATTEMPTS) {
+    max_attempts = APP_MIN_EXPLOIT_ATTEMPTS;
+  }
+#else
+  if (max_attempts < 8) {
+    max_attempts = 8;
+  }
+#endif
+#endif
+#if defined(APP_FAIL_CLOSED_P0) && APP_FAIL_CLOSED_P0
+  /* Keep a failed, clean P0 child retryable.  The shared dirty bit below
+   * still terminates immediately once a physical gate has been attempted. */
+  if (max_attempts < 4) {
+    max_attempts = 4;
+  }
+#endif
+#ifdef APP_MAX_EXPLOIT_ATTEMPTS
+  /* A physical-gate candidate must be single-shot when a wrapper explicitly
+   * requests it.  This cap is applied after the fail-closed minimum so a
+   * diagnostic candidate cannot silently become a multi-reboot run because
+   * the Android wrapper exported a larger EXPLOIT_ATTEMPTS value. */
+  if (max_attempts > APP_MAX_EXPLOIT_ATTEMPTS) {
+    max_attempts = APP_MAX_EXPLOIT_ATTEMPTS;
+  }
+#endif
+  if (attempt_timeout_sec < 660) {
+    attempt_timeout_sec = 660;
+  }
+  if (p0_attempt_timeout_sec < 600) {
+    p0_attempt_timeout_sec = 600;
+  }
+#endif
   if (p0_attempt_timeout_sec > attempt_timeout_sec) {
     p0_attempt_timeout_sec = attempt_timeout_sec;
   }

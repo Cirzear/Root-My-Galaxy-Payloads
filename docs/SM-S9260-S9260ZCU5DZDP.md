@@ -79,7 +79,7 @@ The ARM64 Image header reports `text_offset = 0`, `image_size = 0x26f0000`,
 and flags `0xa`. The ABL LinuxLoader contains the exact tuple
 `[0x80000, 0x5600000, 0x3c00000, 0x8000]`; together with the vendor boot
 `gunyah_hyp_region@80000000` data this yields `P0_PHYS_OFFSET = 0x80000000`
-and `P0_KERNEL_PHYS_LOAD = 0x80080000`.
+and `P0_KERNEL_PHYS_LOAD = 0xa8000000` (P0 Delta = `0x28000000`).
 
 ## Generated artifacts
 
